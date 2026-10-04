@@ -333,16 +333,35 @@ def paste_text(text: str) -> None:
             raise OSError("The text was sent, but the original clipboard could not be restored")
 
 
+def canonical_key_name(name: str | None) -> str:
+    if not name:
+        return ""
+    raw = name
+    try:
+        name = keyboard.normalize_name(name)
+    except ValueError:
+        name = raw.lower()
+    name = NAME_ALIASES.get(name, name)
+    for prefix in ("left ", "right "):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    name = NAME_ALIASES.get(name, name)
+    if len(name) == 1:
+        name = name.lower()
+    return name
+
+
 def canonical_hotkey(names: list[str]) -> str:
-    cleaned = [NAME_ALIASES.get(keyboard.normalize_name(name), keyboard.normalize_name(name)) for name in names if name]
+    cleaned = [canonical_key_name(name) for name in names if name]
+    cleaned = [name for name in cleaned if name]
     if not cleaned:
         return ""
     return keyboard.get_hotkey_name(cleaned)
 
 
 def normalize_hotkey(text: str) -> str:
-    parts = [part.strip().lower() for part in text.split("+")]
-    parts = [NAME_ALIASES.get(part, part) for part in parts if part]
+    parts = [canonical_key_name(part.strip()) for part in text.split("+")]
+    parts = [part for part in parts if part]
     if not parts:
         return ""
     return keyboard.get_hotkey_name(parts)
@@ -351,6 +370,105 @@ def normalize_hotkey(text: str) -> str:
 def is_bindable(hotkey: str) -> bool:
     parts = [part for part in hotkey.split("+") if part]
     return any(part not in MODIFIER_NAMES for part in parts)
+
+
+def split_hotkey(hotkey: str) -> tuple[frozenset[str], str]:
+    parts = [part for part in normalize_hotkey(hotkey).split("+") if part]
+    mods: set[str] = set()
+    keys: list[str] = []
+    for part in parts:
+        if part == "alt gr":
+            mods.update({"ctrl", "alt"})
+        elif part in MODIFIER_NAMES:
+            mods.add(part)
+        else:
+            keys.append(part)
+    if len(keys) != 1:
+        raise ValueError(f"Hotkey must include one non-modifier key: {hotkey}")
+    return frozenset(mods), keys[0]
+
+
+def current_modifiers() -> frozenset[str]:
+    mods: set[str] = set()
+    if user32.GetAsyncKeyState(0x11) & 0x8000:
+        mods.add("ctrl")
+    if user32.GetAsyncKeyState(0x10) & 0x8000:
+        mods.add("shift")
+    if user32.GetAsyncKeyState(0x12) & 0x8000:
+        mods.add("alt")
+    if user32.GetAsyncKeyState(0x5B) & 0x8000 or user32.GetAsyncKeyState(0x5C) & 0x8000:
+        mods.add("windows")
+    return frozenset(mods)
+
+
+def hotkey_matches(hotkey: str, pressed_mods: frozenset[str], key: str) -> bool:
+    mods, trigger = split_hotkey(hotkey)
+    return pressed_mods == mods and canonical_key_name(key) == trigger
+
+
+class HotkeyRouter:
+    """Fire a binding only when its modifiers match exactly.
+
+    keyboard.add_hotkey('ctrl+shift+a') also fires on Ctrl+A. This hook checks
+    the real modifier keys so Shift is required when it is part of the combo.
+    """
+
+    def __init__(self, on_fire) -> None:
+        self._on_fire = on_fire
+        self._bindings: dict[tuple[frozenset[str], str], str] = {}
+        self._hook = None
+        self._suppress_key = ""
+
+    def set_bindings(self, items: list[tuple[str, str]]) -> list[str]:
+        self.stop()
+        failed: list[str] = []
+        seen: set[tuple[frozenset[str], str]] = set()
+        for hotkey, path in items:
+            try:
+                combo = split_hotkey(hotkey)
+            except Exception:
+                logging.exception("Could not register %s", hotkey)
+                failed.append(pretty_hotkey(hotkey))
+                continue
+            if combo in seen:
+                failed.append(pretty_hotkey(hotkey))
+                continue
+            seen.add(combo)
+            self._bindings[combo] = path
+        if self._bindings:
+            self._hook = keyboard.hook(self._on_event, suppress=True)
+        return failed
+
+    def stop(self) -> None:
+        hook = self._hook
+        self._hook = None
+        self._bindings = {}
+        self._suppress_key = ""
+        if hook is not None:
+            try:
+                keyboard.unhook(hook)
+            except KeyError:
+                pass
+
+    def _on_event(self, event) -> bool:
+        name = canonical_key_name(event.name)
+        if not name:
+            return True
+        if name in MODIFIER_NAMES:
+            return True
+        if event.event_type == keyboard.KEY_DOWN:
+            if self._suppress_key == name:
+                return False
+            path = self._bindings.get((current_modifiers(), name))
+            if path is None:
+                return True
+            self._suppress_key = name
+            self._on_fire(path)
+            return False
+        if self._suppress_key == name:
+            self._suppress_key = ""
+            return False
+        return True
 
 
 def pretty_hotkey(hotkey: str) -> str:
@@ -625,7 +743,7 @@ class App:
         self._center(self.root, 860, 480)
         self._quitting = False
         self._bindings: list[tuple[str, str]] = []
-        self._removers: list = []
+        self._router = HotkeyRouter(self._enqueue)
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._worker = threading.Thread(target=self._paste_loop, name="autokey-paste", daemon=True)
         self.icon = None
@@ -873,34 +991,14 @@ class App:
             self.status.set(f"{count} hotkeys active.")
 
     def _register_hotkeys(self) -> None:
-        self._suspend_hotkeys()
-        failed = []
-        for hotkey, path in self._bindings:
-            try:
-                remover = keyboard.add_hotkey(
-                    hotkey,
-                    self._enqueue,
-                    args=(path,),
-                    suppress=True,
-                    trigger_on_release=True,
-                )
-                self._removers.append(remover)
-            except Exception:
-                logging.exception("Could not register %s", hotkey)
-                failed.append(pretty_hotkey(hotkey))
+        failed = self._router.set_bindings(self._bindings)
         if failed:
             self.status.set("Could not register: " + ", ".join(failed))
         else:
             self._refresh_rows()
 
     def _suspend_hotkeys(self) -> None:
-        removers = self._removers
-        self._removers = []
-        for remover in removers:
-            try:
-                keyboard.remove_hotkey(remover)
-            except Exception:
-                logging.exception("Could not remove a hotkey")
+        self._router.stop()
 
     def _enqueue(self, path: str) -> None:
         if not self._quitting:
@@ -995,8 +1093,18 @@ def self_test() -> None:
             raise SystemExit("paste did not send ctrl+v")
         if get_clipboard_text() != "autokey original ✓":
             raise SystemExit("clipboard was not restored after paste")
-        remover = keyboard.add_hotkey("ctrl+alt+1", lambda: None, suppress=True, trigger_on_release=True)
-        keyboard.remove_hotkey(remover)
+        if split_hotkey("ctrl+shift+a") != (frozenset({"ctrl", "shift"}), "a"):
+            raise SystemExit("split failed")
+        if hotkey_matches("ctrl+shift+a", frozenset({"ctrl"}), "a"):
+            raise SystemExit("ctrl+a must not match ctrl+shift+a")
+        if hotkey_matches("ctrl+shift+a", frozenset({"ctrl", "shift", "alt"}), "a"):
+            raise SystemExit("extra modifiers must not match")
+        if not hotkey_matches("ctrl+shift+a", frozenset({"ctrl", "shift"}), "A"):
+            raise SystemExit("ctrl+shift+a should match")
+        if hotkey_matches("ctrl+a", frozenset({"ctrl", "shift"}), "a"):
+            raise SystemExit("ctrl+shift+a must not match ctrl+a")
+        if not hotkey_matches("ctrl+a", frozenset({"ctrl"}), "a"):
+            raise SystemExit("ctrl+a should match")
         if canonical_hotkey(["left ctrl", "left alt", "1"]) != "ctrl+alt+1":
             raise SystemExit("hotkey name failed")
         if normalize_hotkey("Ctrl + Alt + A") != "ctrl+alt+a":
