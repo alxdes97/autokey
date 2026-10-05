@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import winreg
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -38,6 +39,8 @@ except ImportError:
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "bindings.json"
 LOG_PATH = APP_DIR / "autokey.log"
+STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE_NAME = "AutoKey"
 
 PASTE_SETTLE_SECONDS = 0.30
 CLIPBOARD_RETRIES = 25
@@ -154,6 +157,53 @@ def acquire_single_instance() -> bool:
         logging.error("CreateMutex failed: %s", ctypes.get_last_error())
         return True
     return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+
+
+def startup_command() -> str:
+    pythonw = APP_DIR / ".venv" / "Scripts" / "pythonw.exe"
+    script = APP_DIR / "autokey.py"
+    if pythonw.is_file():
+        return f'"{pythonw}" "{script}"'
+    return f'"{APP_DIR / "run.bat"}"'
+
+
+def is_our_startup_command(value: str) -> bool:
+    marker = str(APP_DIR).casefold().replace("/", "\\")
+    return marker in value.casefold().replace("/", "\\")
+
+
+def read_startup_command(value_name: str = STARTUP_VALUE_NAME) -> str | None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_READ) as key:
+            value, _regtype = winreg.QueryValueEx(key, value_name)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return str(value)
+
+
+def is_startup_enabled(value_name: str = STARTUP_VALUE_NAME) -> bool:
+    value = read_startup_command(value_name)
+    return bool(value) and is_our_startup_command(value)
+
+
+def set_startup_enabled(enabled: bool, value_name: str = STARTUP_VALUE_NAME) -> None:
+    if enabled:
+        pythonw = APP_DIR / ".venv" / "Scripts" / "pythonw.exe"
+        if not (APP_DIR / "autokey.py").is_file() or not (pythonw.is_file() or (APP_DIR / "run.bat").is_file()):
+            raise FileNotFoundError("AutoKey could not find a program to start with Windows.")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY) as key:
+            winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, startup_command())
+        return
+    access = winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, access) as key:
+            current, _regtype = winreg.QueryValueEx(key, value_name)
+            if is_our_startup_command(str(current)):
+                winreg.DeleteValue(key, value_name)
+    except FileNotFoundError:
+        return
 
 
 def _open_clipboard() -> bool:
@@ -614,7 +664,7 @@ class BindingDialog(tk.Toplevel):
         self.hotkey_var = tk.StringVar(value=current[0] if current else "")
         self.hotkey_entry = ttk.Entry(self, textvariable=self.hotkey_var, width=36)
         self.hotkey_entry.grid(row=1, column=0, sticky="we", pady=(4, 0))
-        self.record_button = ttk.Button(self, text="Record", command=self._toggle_record)
+        self.record_button = ttk.Button(self, text="Record", command=self._toggle_record, width=10)
         self.record_button.grid(row=1, column=1, padx=(8, 0), pady=(4, 0))
 
         self.hint_var = tk.StringVar(value="Click Record and press the keys, or type a combo such as ctrl+alt+1.")
@@ -625,12 +675,12 @@ class BindingDialog(tk.Toplevel):
         ttk.Label(self, text="Text file").grid(row=3, column=0, sticky="w")
         self.file_var = tk.StringVar(value=current[1] if current else "")
         ttk.Entry(self, textvariable=self.file_var, width=36).grid(row=4, column=0, sticky="we", pady=(4, 0))
-        ttk.Button(self, text="Browse", command=self._browse).grid(row=4, column=1, padx=(8, 0), pady=(4, 0))
+        ttk.Button(self, text="Browse", command=self._browse, width=10).grid(row=4, column=1, padx=(8, 0), pady=(4, 0))
 
         actions = ttk.Frame(self)
         actions.grid(row=5, column=0, columnspan=2, sticky="e", pady=(16, 0))
-        ttk.Button(actions, text="Cancel", command=self._cancel).pack(side="right")
-        ttk.Button(actions, text="Save", command=self._save).pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="Cancel", command=self._cancel, width=10).pack(side="right")
+        ttk.Button(actions, text="Save", command=self._save, width=10).pack(side="right", padx=(0, 8))
 
         self.columnconfigure(0, weight=1)
         self.bind("<Escape>", lambda _event: self._cancel())
@@ -749,9 +799,11 @@ class App:
         self.icon = None
         self._photo = None
         self.status = tk.StringVar(value="No hotkeys yet.")
+        self.start_with_windows = tk.BooleanVar(value=False)
         self._apply_style()
         self._build()
         self._load()
+        self._sync_startup_checkbox()
         self._refresh_rows()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._worker.start()
@@ -772,7 +824,6 @@ class App:
         style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
         style.configure("Hint.TLabel", font=("Segoe UI", 10), foreground="#555555")
         style.configure("Status.TLabel", font=("Segoe UI", 9), foreground="#444444")
-        style.configure("TButton", font=("Segoe UI", 10), padding=(12, 6))
         style.configure("Treeview", font=("Segoe UI", 10), rowheight=28)
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
@@ -819,11 +870,17 @@ class App:
         buttons.pack(fill="x", pady=(12, 8))
         left = ttk.Frame(buttons)
         left.pack(side="left")
-        ttk.Button(left, text="Add", command=self.add_binding).pack(side="left")
-        ttk.Button(left, text="Edit", command=self.edit_binding).pack(side="left", padx=(8, 0))
-        ttk.Button(left, text="Remove", command=self.remove_binding).pack(side="left", padx=(8, 0))
-        ttk.Button(buttons, text="Hide Window", command=self.hide_window).pack(side="right")
+        ttk.Button(left, text="Add", command=self.add_binding, width=10).pack(side="left")
+        ttk.Button(left, text="Edit", command=self.edit_binding, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(left, text="Remove", command=self.remove_binding, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Hide Window", command=self.hide_window, width=16).pack(side="right")
 
+        ttk.Checkbutton(
+            outer,
+            text="Start AutoKey when Windows starts",
+            variable=self.start_with_windows,
+            command=self._on_startup_toggle,
+        ).pack(anchor="w", pady=(0, 8))
         ttk.Label(outer, textvariable=self.status, style="Status.TLabel").pack(anchor="w")
 
     def run(self) -> None:
@@ -850,6 +907,7 @@ class App:
         self.root.after(0, self._show_window)
 
     def _show_window(self) -> None:
+        self._sync_startup_checkbox()
         self._refresh_rows()
         self.root.attributes("-alpha", 1.0)
         self.root.deiconify()
@@ -861,6 +919,28 @@ class App:
 
     def hide_window(self) -> None:
         self.root.withdraw()
+
+    def _sync_startup_checkbox(self) -> None:
+        self.start_with_windows.set(is_startup_enabled())
+
+    def _on_startup_toggle(self) -> None:
+        wanted = bool(self.start_with_windows.get())
+        try:
+            set_startup_enabled(wanted)
+        except Exception:
+            logging.exception("Could not update the Windows startup setting")
+            self._sync_startup_checkbox()
+            messagebox.showerror(
+                "AutoKey",
+                "Could not change the Windows startup setting.",
+                parent=self.root,
+            )
+            return
+        self._sync_startup_checkbox()
+        if wanted and is_startup_enabled():
+            self.status.set("AutoKey will start when you sign in to Windows.")
+        elif not wanted and not is_startup_enabled():
+            self.status.set("AutoKey will not start with Windows.")
 
     def exit_app(self, _icon=None, _item=None) -> None:
         if self._quitting:
@@ -1113,6 +1193,31 @@ def self_test() -> None:
             raise SystemExit("bindable check failed")
         keyboard.parse_hotkey("ctrl+alt+1")
         make_icon()
+        command = startup_command()
+        if str(APP_DIR) not in command or "autokey" not in command.casefold():
+            raise SystemExit("startup command is wrong")
+        if not is_our_startup_command(command) or is_our_startup_command(r'"C:\Other\autokey.py"'):
+            raise SystemExit("startup path check failed")
+        test_name = "AutoKey.SelfTest"
+        previous = read_startup_command(test_name)
+        try:
+            set_startup_enabled(True, value_name=test_name)
+            if not is_startup_enabled(value_name=test_name):
+                raise SystemExit("startup enable failed")
+            if read_startup_command(test_name) != command:
+                raise SystemExit("startup command was not stored")
+            set_startup_enabled(False, value_name=test_name)
+            if is_startup_enabled(value_name=test_name) or read_startup_command(test_name) is not None:
+                raise SystemExit("startup disable failed")
+        finally:
+            if previous is None:
+                try:
+                    set_startup_enabled(False, value_name=test_name)
+                except OSError:
+                    pass
+            else:
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY) as key:
+                    winreg.SetValueEx(key, test_name, 0, winreg.REG_SZ, previous)
         print("self-test ok")
     finally:
         restore_clipboard(original)
