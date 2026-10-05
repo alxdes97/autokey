@@ -788,9 +788,9 @@ class App:
         self.root.withdraw()
         self.root.attributes("-alpha", 0.0)
         self.root.title("AutoKey")
-        self.root.minsize(680, 360)
-        self.root.geometry("860x480")
-        self._center(self.root, 860, 480)
+        self.root.minsize(760, 520)
+        self.root.geometry("860x560")
+        self._center(self.root, 860, 560)
         self._quitting = False
         self._bindings: list[tuple[str, str]] = []
         self._router = HotkeyRouter(self._enqueue)
@@ -851,6 +851,26 @@ class App:
             wraplength=800,
         ).pack(anchor="w", pady=(0, 12))
 
+        footer = ttk.Frame(outer)
+        footer.pack(side="bottom", fill="x", pady=(12, 0))
+        buttons = ttk.Frame(footer)
+        buttons.pack(fill="x")
+        left = ttk.Frame(buttons)
+        left.pack(side="left")
+        ttk.Button(left, text="Add", command=self.add_binding, width=10).pack(side="left")
+        ttk.Button(left, text="Edit", command=self.edit_binding, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(left, text="Remove", command=self.remove_binding, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Hide Window", command=self.hide_window, width=16).pack(side="right")
+        tk.Checkbutton(
+            footer,
+            text="Start AutoKey when Windows starts",
+            variable=self.start_with_windows,
+            command=self._on_startup_toggle,
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).pack(anchor="w", pady=(10, 4))
+        ttk.Label(footer, textvariable=self.status, style="Status.TLabel").pack(anchor="w")
+
         table = ttk.Frame(outer)
         table.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(table, columns=("hotkey", "file", "preview"), show="headings", selectmode="browse")
@@ -865,23 +885,6 @@ class App:
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", lambda _event: self.edit_binding())
-
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill="x", pady=(12, 8))
-        left = ttk.Frame(buttons)
-        left.pack(side="left")
-        ttk.Button(left, text="Add", command=self.add_binding, width=10).pack(side="left")
-        ttk.Button(left, text="Edit", command=self.edit_binding, width=10).pack(side="left", padx=(8, 0))
-        ttk.Button(left, text="Remove", command=self.remove_binding, width=10).pack(side="left", padx=(8, 0))
-        ttk.Button(buttons, text="Hide Window", command=self.hide_window, width=16).pack(side="right")
-
-        ttk.Checkbutton(
-            outer,
-            text="Start AutoKey when Windows starts",
-            variable=self.start_with_windows,
-            command=self._on_startup_toggle,
-        ).pack(anchor="w", pady=(0, 8))
-        ttk.Label(outer, textvariable=self.status, style="Status.TLabel").pack(anchor="w")
 
     def run(self) -> None:
         import pystray
