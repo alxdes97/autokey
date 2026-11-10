@@ -43,6 +43,7 @@ STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "AutoKey"
 
 PASTE_SETTLE_SECONDS = 0.30
+CLIPBOARD_POLL_SECONDS = 0.12
 CLIPBOARD_RETRIES = 25
 MAX_FORMAT_BYTES = 64 * 1024 * 1024
 
@@ -95,6 +96,10 @@ user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
 user32.SetClipboardData.restype = wintypes.HANDLE
 user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
 user32.EnumClipboardFormats.restype = wintypes.UINT
+user32.GetClipboardSequenceNumber.argtypes = []
+user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
@@ -367,20 +372,125 @@ def release_modifiers() -> None:
             user32.keybd_event(vk, scan, flags, 0)
 
 
+class ClipboardSilence:
+    """Skip clipboard-transform while AutoKey itself is writing the clipboard."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._depth = 0
+
+    def __enter__(self) -> ClipboardSilence:
+        with self._lock:
+            self._depth += 1
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        with self._lock:
+            self._depth -= 1
+
+    def active(self) -> bool:
+        with self._lock:
+            return self._depth > 0
+
+
+CLIPBOARD_SILENCE = ClipboardSilence()
+
+
+def transform_text(text: str, pairs: list[tuple[str, str]]) -> str:
+    """Replace each source spell with its pair. Longer spells win; replacements do not chain."""
+    mapping = {source: dest for source, dest in pairs if source}
+    if not mapping or not text:
+        return text
+    sources = sorted(mapping, key=len, reverse=True)
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        matched = next((source for source in sources if text.startswith(source, index)), None)
+        if matched is None:
+            out.append(text[index])
+            index += 1
+            continue
+        out.append(mapping[matched])
+        index += len(matched)
+    return "".join(out)
+
+
+class ClipboardWatcher:
+    """When enabled, rewrite clipboard text using the current spell pairs."""
+
+    def __init__(self, settings, on_changed=None) -> None:
+        self._settings = settings
+        self._on_changed = on_changed
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_seq = 0
+
+    def start(self) -> None:
+        self._last_seq = user32.GetClipboardSequenceNumber()
+        self._thread = threading.Thread(target=self._run, name="autokey-clipboard", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.wait(CLIPBOARD_POLL_SECONDS):
+            try:
+                self._tick()
+            except Exception:
+                logging.exception("Clipboard transform failed")
+
+    def _tick(self) -> None:
+        seq = user32.GetClipboardSequenceNumber()
+        if CLIPBOARD_SILENCE.active():
+            self._last_seq = seq
+            return
+        if seq == self._last_seq:
+            return
+        self._last_seq = seq
+        enabled, pairs = self._settings()
+        if not enabled or not pairs:
+            return
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return
+        try:
+            text = get_clipboard_text()
+        except OSError:
+            return
+        updated = transform_text(text, pairs)
+        if updated == text:
+            return
+        with CLIPBOARD_SILENCE:
+            set_clipboard_text(updated)
+            self._last_seq = user32.GetClipboardSequenceNumber()
+        logging.info("Transformed clipboard text (%s -> %s characters)", len(text), len(updated))
+        if self._on_changed is not None:
+            try:
+                self._on_changed()
+            except Exception:
+                logging.exception("Could not report clipboard transform")
+
+
 def paste_text(text: str) -> None:
     saved = backup_clipboard()
     if saved is None:
         raise OSError("Clipboard is busy, so nothing was pasted")
-    try:
-        set_clipboard_text(text)
-        release_modifiers()
-        time.sleep(0.05)
-        keyboard.send("ctrl+v")
-        # The focused app reads the clipboard after the keystroke is queued.
-        time.sleep(PASTE_SETTLE_SECONDS)
-    finally:
-        if not restore_clipboard(saved):
-            raise OSError("The text was sent, but the original clipboard could not be restored")
+    with CLIPBOARD_SILENCE:
+        try:
+            set_clipboard_text(text)
+            release_modifiers()
+            time.sleep(0.05)
+            keyboard.send("ctrl+v")
+            # The focused app reads the clipboard after the keystroke is queued.
+            time.sleep(PASTE_SETTLE_SECONDS)
+        finally:
+            if not restore_clipboard(saved):
+                raise OSError("The text was sent, but the original clipboard could not be restored")
 
 
 def canonical_key_name(name: str | None) -> str:
@@ -781,6 +891,66 @@ class BindingDialog(tk.Toplevel):
         self.destroy()
 
 
+class PairDialog(tk.Toplevel):
+    def __init__(self, master: tk.Tk, current: tuple[str, str] | None, taken: set[str]) -> None:
+        super().__init__(master)
+        self.result: tuple[str, str] | None = None
+        self._taken = taken
+        self.title("Edit Spell" if current else "Add Spell")
+        self.resizable(False, False)
+        self.transient(master)
+        self.configure(padx=16, pady=14)
+
+        ttk.Label(self, text="Spell on the clipboard").grid(row=0, column=0, sticky="w")
+        self.source_var = tk.StringVar(value=current[0] if current else "")
+        ttk.Entry(self, textvariable=self.source_var, width=36).grid(row=1, column=0, sticky="we", pady=(4, 10))
+
+        ttk.Label(self, text="Replace with").grid(row=2, column=0, sticky="w")
+        self.dest_var = tk.StringVar(value=current[1] if current else "")
+        ttk.Entry(self, textvariable=self.dest_var, width=36).grid(row=3, column=0, sticky="we", pady=(4, 0))
+        ttk.Label(
+            self,
+            text="Example: A becomes B. When the clipboard changes, every matching spell is replaced.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+
+        actions = ttk.Frame(self)
+        actions.grid(row=5, column=0, sticky="e", pady=(16, 0))
+        ttk.Button(actions, text="Cancel", command=self._cancel, width=10).pack(side="right")
+        ttk.Button(actions, text="Save", command=self._save, width=10).pack(side="right", padx=(0, 8))
+
+        self.columnconfigure(0, weight=1)
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+        self.after(10, self._center)
+
+    def _center(self) -> None:
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() - width) // 2
+        y = (self.winfo_screenheight() - height) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _save(self) -> None:
+        source = self.source_var.get()
+        dest = self.dest_var.get()
+        if not source:
+            messagebox.showerror("AutoKey", "Enter the spell to look for.", parent=self)
+            return
+        if source in self._taken:
+            messagebox.showerror("AutoKey", "That spell is already in the list.", parent=self)
+            return
+        self.result = (source, dest)
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class App:
     def __init__(self) -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoKey.TextHotkeys")
@@ -793,20 +963,27 @@ class App:
         self._center(self.root, 860, 560)
         self._quitting = False
         self._bindings: list[tuple[str, str]] = []
+        self._pairs: list[tuple[str, str]] = []
+        self._pair_lock = threading.Lock()
+        self._transform_on = False
         self._router = HotkeyRouter(self._enqueue)
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._worker = threading.Thread(target=self._paste_loop, name="autokey-paste", daemon=True)
+        self._watcher = ClipboardWatcher(self._transform_settings, self._on_clipboard_transformed)
         self.icon = None
         self._photo = None
         self.status = tk.StringVar(value="No hotkeys yet.")
         self.start_with_windows = tk.BooleanVar(value=False)
+        self.transform_enabled = tk.BooleanVar(value=False)
         self._apply_style()
         self._build()
         self._load()
         self._sync_startup_checkbox()
         self._refresh_rows()
+        self._refresh_pairs()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._worker.start()
+        self._watcher.start()
 
     def _center(self, window: tk.Misc, width: int, height: int) -> None:
         window.update_idletasks()
@@ -853,14 +1030,7 @@ class App:
 
         footer = ttk.Frame(outer)
         footer.pack(side="bottom", fill="x", pady=(12, 0))
-        buttons = ttk.Frame(footer)
-        buttons.pack(fill="x")
-        left = ttk.Frame(buttons)
-        left.pack(side="left")
-        ttk.Button(left, text="Add", command=self.add_binding, width=10).pack(side="left")
-        ttk.Button(left, text="Edit", command=self.edit_binding, width=10).pack(side="left", padx=(8, 0))
-        ttk.Button(left, text="Remove", command=self.remove_binding, width=10).pack(side="left", padx=(8, 0))
-        ttk.Button(buttons, text="Hide Window", command=self.hide_window, width=16).pack(side="right")
+        ttk.Button(footer, text="Hide Window", command=self.hide_window, width=16).pack(side="right")
         tk.Checkbutton(
             footer,
             text="Start AutoKey when Windows starts",
@@ -868,10 +1038,15 @@ class App:
             command=self._on_startup_toggle,
             font=("Segoe UI", 10),
             anchor="w",
-        ).pack(anchor="w", pady=(10, 4))
-        ttk.Label(footer, textvariable=self.status, style="Status.TLabel").pack(anchor="w")
+        ).pack(anchor="w")
+        ttk.Label(footer, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(4, 0))
 
-        table = ttk.Frame(outer)
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True)
+
+        hotkeys = ttk.Frame(notebook, padding=8)
+        notebook.add(hotkeys, text="Hotkeys")
+        table = ttk.Frame(hotkeys)
         table.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(table, columns=("hotkey", "file", "preview"), show="headings", selectmode="browse")
         self.tree.heading("hotkey", text="Hotkey")
@@ -885,6 +1060,45 @@ class App:
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", lambda _event: self.edit_binding())
+        hotkey_buttons = ttk.Frame(hotkeys)
+        hotkey_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(hotkey_buttons, text="Add", command=self.add_binding, width=10).pack(side="left")
+        ttk.Button(hotkey_buttons, text="Edit", command=self.edit_binding, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(hotkey_buttons, text="Remove", command=self.remove_binding, width=10).pack(side="left", padx=(8, 0))
+
+        transform = ttk.Frame(notebook, padding=8)
+        notebook.add(transform, text="Clipboard transform")
+        tk.Checkbutton(
+            transform,
+            text="Enable clipboard transformation",
+            variable=self.transform_enabled,
+            command=self._on_transform_toggle,
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).pack(anchor="w")
+        ttk.Label(
+            transform,
+            text="Add spell pairs such as A → B. When this is on, new clipboard text is rewritten using those pairs.",
+            style="Hint.TLabel",
+            wraplength=760,
+        ).pack(anchor="w", pady=(2, 8))
+        pair_table = ttk.Frame(transform)
+        pair_table.pack(fill="both", expand=True)
+        self.pair_tree = ttk.Treeview(pair_table, columns=("source", "dest"), show="headings", selectmode="browse")
+        self.pair_tree.heading("source", text="Spell")
+        self.pair_tree.heading("dest", text="Becomes")
+        self.pair_tree.column("source", width=360, minwidth=140, stretch=True)
+        self.pair_tree.column("dest", width=360, minwidth=140, stretch=True)
+        pair_scroll = ttk.Scrollbar(pair_table, orient="vertical", command=self.pair_tree.yview)
+        self.pair_tree.configure(yscrollcommand=pair_scroll.set)
+        self.pair_tree.pack(side="left", fill="both", expand=True)
+        pair_scroll.pack(side="right", fill="y")
+        self.pair_tree.bind("<Double-1>", lambda _event: self.edit_pair())
+        pair_buttons = ttk.Frame(transform)
+        pair_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(pair_buttons, text="Add", command=self.add_pair, width=10).pack(side="left")
+        ttk.Button(pair_buttons, text="Edit", command=self.edit_pair, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(pair_buttons, text="Remove", command=self.remove_pair, width=10).pack(side="left", padx=(8, 0))
 
     def run(self) -> None:
         import pystray
@@ -912,6 +1126,7 @@ class App:
     def _show_window(self) -> None:
         self._sync_startup_checkbox()
         self._refresh_rows()
+        self._refresh_pairs()
         self.root.attributes("-alpha", 1.0)
         self.root.deiconify()
         self.root.state("normal")
@@ -945,6 +1160,76 @@ class App:
         elif not wanted and not is_startup_enabled():
             self.status.set("AutoKey will not start with Windows.")
 
+    def _transform_settings(self) -> tuple[bool, list[tuple[str, str]]]:
+        with self._pair_lock:
+            return self._transform_on, list(self._pairs)
+
+    def _on_transform_toggle(self) -> None:
+        self._transform_on = bool(self.transform_enabled.get())
+        self._save()
+        if self._transform_on:
+            self.status.set("Clipboard transformation is on.")
+        else:
+            self.status.set("Clipboard transformation is off.")
+
+    def _on_clipboard_transformed(self) -> None:
+        self._set_status("Updated the clipboard using your spell pairs.")
+
+    def add_pair(self) -> None:
+        self._edit_pair(None)
+
+    def edit_pair(self) -> None:
+        selected = self.pair_tree.selection()
+        if not selected:
+            messagebox.showinfo("AutoKey", "Select a spell pair first.", parent=self.root)
+            return
+        index = int(selected[0].split(":", 1)[1])
+        if index < 0 or index >= len(self._pairs):
+            return
+        self._edit_pair(index)
+
+    def remove_pair(self) -> None:
+        selected = self.pair_tree.selection()
+        if not selected:
+            messagebox.showinfo("AutoKey", "Select a spell pair first.", parent=self.root)
+            return
+        index = int(selected[0].split(":", 1)[1])
+        if index < 0 or index >= len(self._pairs):
+            return
+        source, dest = self._pairs[index]
+        label = f"{source} → {dest}" if dest else f"{source} → (empty)"
+        if not messagebox.askyesno("AutoKey", f"Remove {label}?", parent=self.root):
+            return
+        with self._pair_lock:
+            self._pairs = [item for i, item in enumerate(self._pairs) if i != index]
+        self._save()
+        self._refresh_pairs()
+
+    def _edit_pair(self, index: int | None) -> None:
+        current = self._pairs[index] if index is not None else None
+        taken = {source for i, (source, _dest) in enumerate(self._pairs) if index is None or i != index}
+        dialog = PairDialog(self.root, current, taken)
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return
+        source, dest = dialog.result
+        with self._pair_lock:
+            if index is None:
+                self._pairs.append((source, dest))
+            else:
+                self._pairs[index] = (source, dest)
+        self._save()
+        self._refresh_pairs()
+
+    def _refresh_pairs(self) -> None:
+        for iid in self.pair_tree.get_children():
+            self.pair_tree.delete(iid)
+        with self._pair_lock:
+            rows = list(self._pairs)
+        for index, (source, dest) in enumerate(rows):
+            self.pair_tree.insert("", "end", iid=f"pair:{index}", values=(source, dest if dest else "(empty)"))
+        self.transform_enabled.set(self._transform_on)
+
     def exit_app(self, _icon=None, _item=None) -> None:
         if self._quitting:
             return
@@ -956,6 +1241,7 @@ class App:
             logging.exception("Could not schedule shutdown")
 
     def _shutdown(self) -> None:
+        self._watcher.stop()
         self._worker.join(timeout=5)
         self._suspend_hotkeys()
         try:
@@ -1036,6 +1322,21 @@ class App:
                 seen.add(hotkey)
                 bindings.append((hotkey, path))
             self._bindings = bindings
+            transform = data.get("clipboard_transform") or {}
+            enabled = bool(transform.get("enabled", False))
+            pairs: list[tuple[str, str]] = []
+            seen_spells: set[str] = set()
+            for item in transform.get("pairs") or []:
+                source = str(item.get("from", ""))
+                dest = str(item.get("to", ""))
+                if not source or source in seen_spells:
+                    continue
+                seen_spells.add(source)
+                pairs.append((source, dest))
+            with self._pair_lock:
+                self._pairs = pairs
+                self._transform_on = enabled
+            self.transform_enabled.set(enabled)
         except Exception:
             logging.exception("Could not read %s", CONFIG_PATH)
             backup = CONFIG_PATH.with_suffix(".json.bak")
@@ -1046,7 +1347,16 @@ class App:
             messagebox.showwarning("AutoKey", "The saved hotkey list could not be read. Starting with an empty list.")
 
     def _save(self) -> None:
-        payload = {"bindings": [{"hotkey": hotkey, "file": path} for hotkey, path in self._bindings]}
+        with self._pair_lock:
+            pairs = list(self._pairs)
+            enabled = self._transform_on
+        payload = {
+            "bindings": [{"hotkey": hotkey, "file": path} for hotkey, path in self._bindings],
+            "clipboard_transform": {
+                "enabled": enabled,
+                "pairs": [{"from": source, "to": dest} for source, dest in pairs],
+            },
+        }
         temporary = CONFIG_PATH.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temporary.replace(CONFIG_PATH)
@@ -1118,9 +1428,12 @@ class App:
         if self._quitting:
             return
         try:
-            self.root.after(0, lambda: self.status.set(text))
-        except tk.TclError:
-            pass
+            self.root.after(0, lambda t=text: self.status.set(t))
+        except (tk.TclError, RuntimeError):
+            try:
+                self.status.set(text)
+            except Exception:
+                pass
 
     def _notify(self, message: str) -> None:
         if self.icon is None:
@@ -1195,6 +1508,14 @@ def self_test() -> None:
         if is_bindable("ctrl+shift") or not is_bindable("ctrl+shift+a"):
             raise SystemExit("bindable check failed")
         keyboard.parse_hotkey("ctrl+alt+1")
+        if transform_text("A and C stay", [("A", "B"), ("C", "B")]) != "B and B stay":
+            raise SystemExit("transform pair failed")
+        if transform_text("AA", [("A", "B"), ("AA", "Z")]) != "Z":
+            raise SystemExit("longest spell should win")
+        if transform_text("A", [("A", "B"), ("B", "C")]) != "B":
+            raise SystemExit("replacements must not chain")
+        if transform_text("hello", [("A", "B")]) != "hello":
+            raise SystemExit("unrelated text should stay")
         make_icon()
         command = startup_command()
         if str(APP_DIR) not in command or "autokey" not in command.casefold():
