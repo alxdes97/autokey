@@ -165,10 +165,13 @@ def acquire_single_instance() -> bool:
 
 
 def startup_command() -> str:
-    pythonw = APP_DIR / ".venv" / "Scripts" / "pythonw.exe"
+    launcher = APP_DIR / "start_autokey.vbs"
+    if launcher.is_file():
+        return f'wscript.exe //nologo "{launcher}"'
+    python_exe = APP_DIR / ".venv" / "Scripts" / "python.exe"
     script = APP_DIR / "autokey.py"
-    if pythonw.is_file():
-        return f'"{pythonw}" "{script}"'
+    if python_exe.is_file():
+        return f'"{python_exe}" "{script}"'
     return f'"{APP_DIR / "run.bat"}"'
 
 
@@ -195,8 +198,10 @@ def is_startup_enabled(value_name: str = STARTUP_VALUE_NAME) -> bool:
 
 def set_startup_enabled(enabled: bool, value_name: str = STARTUP_VALUE_NAME) -> None:
     if enabled:
-        pythonw = APP_DIR / ".venv" / "Scripts" / "pythonw.exe"
-        if not (APP_DIR / "autokey.py").is_file() or not (pythonw.is_file() or (APP_DIR / "run.bat").is_file()):
+        python_exe = APP_DIR / ".venv" / "Scripts" / "python.exe"
+        if not (APP_DIR / "autokey.py").is_file() or not (
+            python_exe.is_file() or (APP_DIR / "start_autokey.vbs").is_file() or (APP_DIR / "run.bat").is_file()
+        ):
             raise FileNotFoundError("AutoKey could not find a program to start with Windows.")
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY) as key:
             winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, startup_command())
@@ -1547,9 +1552,16 @@ def self_test() -> None:
         restore_clipboard(original)
 
 
+def hide_console() -> None:
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)
+
+
 def main() -> None:
     if sys.platform != "win32":
         raise SystemExit("AutoKey runs on Windows.")
+    hide_console()
     enable_dpi()
     setup_logging()
     if "--self-test" in sys.argv:

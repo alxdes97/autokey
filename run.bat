@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-if exist "%~dp0.venv\Scripts\pythonw.exe" goto launch
+if exist "%~dp0.venv\Scripts\python.exe" goto launch
 
 echo Setting up AutoKey...
 set "BASEPY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
@@ -19,4 +19,4 @@ if errorlevel 1 (
 )
 
 :launch
-start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0autokey.py"
+wscript //nologo "%~dp0start_autokey.vbs"
