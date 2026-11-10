@@ -7,7 +7,8 @@ Exit is only on the tray menu.
 A hotkey copies that file's text into the focused box, then puts back whatever
 was on the clipboard before the paste.
 
-Start it with run.bat, or with:  .venv\\Scripts\\pythonw.exe autokey.py
+Start it with run.bat. On a new computer, run.bat builds a local .venv
+from whatever Python 3 is installed; do not copy .venv between machines.
 """
 
 from __future__ import annotations

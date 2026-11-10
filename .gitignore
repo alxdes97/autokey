@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+autokey.log
+bindings.json
+*.json.tmp
+*.json.bak
+_ui_*.png
+_font_check.png
+_selftest_snippet.txt
+_pyw_ok.txt

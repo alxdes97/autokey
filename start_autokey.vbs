@@ -7,7 +7,7 @@ folder = fso.GetParentFolderName(WScript.ScriptFullName)
 py = folder & "\.venv\Scripts\python.exe"
 script = folder & "\autokey.py"
 If Not fso.FileExists(py) Then
-    sh.Popup "AutoKey is not set up yet. Run run.bat first.", 8, "AutoKey", 16
+    sh.Popup "AutoKey is not set up yet. Double-click run.bat first.", 8, "AutoKey", 16
     WScript.Quit 1
 End If
 sh.CurrentDirectory = folder
