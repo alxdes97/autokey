@@ -7,6 +7,10 @@ Exit is only on the tray menu.
 A hotkey copies that file's text into the focused box, then puts back whatever
 was on the clipboard before the paste.
 
+The Meetings tab signs in to Job Tracker. Interviews that start within the
+next hour raise a popup every 15 minutes, and every 10 minutes once they
+are within 30 minutes.
+
 Start it with run.bat. On a new computer, run.bat builds a local .venv
 from whatever Python 3 is installed; do not copy .venv between machines.
 """
@@ -21,8 +25,12 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
 import winreg
 from ctypes import wintypes
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -47,6 +55,12 @@ PASTE_SETTLE_SECONDS = 0.30
 CLIPBOARD_POLL_SECONDS = 0.12
 CLIPBOARD_RETRIES = 25
 MAX_FORMAT_BYTES = 64 * 1024 * 1024
+DEFAULT_SERVER = "http://213.59.112.27:5000"
+REMIND_HORIZON = timedelta(hours=1)
+REMIND_SOON = timedelta(minutes=30)
+REMIND_EVERY = timedelta(minutes=15)
+REMIND_SOON_EVERY = timedelta(minutes=10)
+REMIND_POLL_SECONDS = 30
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -109,6 +123,8 @@ user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, cty
 user32.keybd_event.restype = None
 user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
 user32.MessageBoxW.restype = ctypes.c_int
+user32.MessageBeep.argtypes = [wintypes.UINT]
+user32.MessageBeep.restype = wintypes.BOOL
 
 kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
@@ -957,6 +973,337 @@ class PairDialog(tk.Toplevel):
         self.destroy()
 
 
+def api_root(raw: str) -> str:
+    """Turn a server address into the API root. A pasted path is dropped."""
+    origin = server_origin(raw)
+    return f"{origin}/api" if origin else ""
+
+
+def server_origin(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    parsed = urllib.parse.urlsplit(text)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def interview_step_label(step: int) -> str:
+    try:
+        number = int(step)
+    except (TypeError, ValueError):
+        number = 1
+    if number < 1:
+        number = 1
+    suffix = "th"
+    mod100 = number % 100
+    if mod100 < 11 or mod100 > 13:
+        last = number % 10
+        if last == 1:
+            suffix = "st"
+        elif last == 2:
+            suffix = "nd"
+        elif last == 3:
+            suffix = "rd"
+    return f"{number}{suffix} interview"
+
+
+def parse_server_time(value) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed
+
+
+def meeting_start(meeting: dict) -> datetime | None:
+    interview = meeting.get("interview") or {}
+    return parse_server_time(interview.get("startsAt"))
+
+
+def meeting_key(meeting: dict) -> str:
+    interview = meeting.get("interview") or {}
+    ident = interview.get("_id") or interview.get("id")
+    if ident:
+        return str(ident)
+    return f"{meeting.get('jobId')}:{interview.get('startsAt')}"
+
+
+def interviewer_label(meeting: dict) -> str:
+    interview = meeting.get("interview") or {}
+    names = []
+    for person in interview.get("interviewers") or []:
+        name = str((person or {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    return ", ".join(names) if names else "Not set"
+
+
+def reminder_gap(until_start: timedelta) -> timedelta | None:
+    """How long to wait before reminding again. None means this meeting is outside the window."""
+    if until_start <= timedelta(0) or until_start > REMIND_HORIZON:
+        return None
+    if until_start <= REMIND_SOON:
+        return REMIND_SOON_EVERY
+    return REMIND_EVERY
+
+
+def due_reminders(meetings: list[dict], last_notified: dict[str, datetime], now: datetime) -> list[dict]:
+    """Meetings that should pop up now. Drops remembered meetings that left the window."""
+    due = []
+    active: set[str] = set()
+    for meeting in meetings:
+        start = meeting_start(meeting)
+        if start is None:
+            continue
+        gap = reminder_gap(start - now)
+        if gap is None:
+            continue
+        key = meeting_key(meeting)
+        active.add(key)
+        previous = last_notified.get(key)
+        if previous is not None and now - previous < gap:
+            continue
+        due.append(meeting)
+    for key in list(last_notified):
+        if key not in active:
+            del last_notified[key]
+    due.sort(key=lambda item: meeting_start(item) or now)
+    return due
+
+
+def format_local_time(when: datetime) -> str:
+    local = when.astimezone()
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local.strftime('%a %b')} {local.day}, {clock}"
+
+
+def remaining_label(start: datetime, now: datetime) -> str:
+    minutes = int((start - now).total_seconds() // 60)
+    if minutes <= 0:
+        return "less than 1 minute"
+    if minutes == 1:
+        return "1 minute"
+    return f"{minutes} minutes"
+
+
+def meeting_alert_text(meeting: dict, now: datetime) -> str:
+    start = meeting_start(meeting)
+    company = str(meeting.get("companyName") or "").strip() or "Company"
+    title = str(meeting.get("jobTitle") or "").strip()
+    lines = [
+        company,
+        interview_step_label(meeting.get("step") or 1),
+        f"Interviewer: {interviewer_label(meeting)}",
+    ]
+    if title:
+        lines.append(title)
+    if start is not None:
+        lines.append(format_local_time(start))
+        lines.append(f"Remaining: {remaining_label(start, now)}")
+    return "\n".join(lines)
+
+
+class TrackerError(Exception):
+    def __init__(self, message: str, status: int = 0) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class JobTrackerClient:
+    """Signs in to Job Tracker and reads the calendar. The token is kept in memory."""
+
+    def __init__(self, server: str, email: str, password: str, token: str = "") -> None:
+        self.root = api_root(server)
+        self.email = (email or "").strip()
+        self.password = password or ""
+        self.token = token or ""
+
+    def meetings(self) -> list[dict]:
+        if not self.root:
+            raise TrackerError("Enter the Job Tracker server address.")
+        if not self.token:
+            self.login()
+        try:
+            payload = self._request("GET", "/calendar")
+        except TrackerError as exc:
+            if exc.status != 401:
+                raise
+            self.login()
+            payload = self._request("GET", "/calendar")
+        meetings = payload.get("meetings") if isinstance(payload, dict) else None
+        return list(meetings) if isinstance(meetings, list) else []
+
+    def login(self) -> str:
+        if not self.email or not self.password:
+            raise TrackerError("Enter the Job Tracker email and password.")
+        payload = self._request(
+            "POST",
+            "/auth/login",
+            {"email": self.email, "password": self.password},
+            auth=False,
+        )
+        token = payload.get("token") if isinstance(payload, dict) else None
+        if not token:
+            raise TrackerError("Job Tracker did not return a sign-in token.")
+        self.token = str(token)
+        return self.token
+
+    def _request(self, method: str, path: str, body: dict | None = None, auth: bool = True) -> dict:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if auth:
+            if not self.token:
+                raise TrackerError("Not signed in.", 401)
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(self.root + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                parsed = json.loads(exc.read().decode("utf-8"))
+                detail = str(parsed.get("error") or parsed.get("message") or "")
+            except Exception:
+                detail = ""
+            raise TrackerError(detail or f"Job Tracker returned {exc.code}.", exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise TrackerError("Could not reach Job Tracker.") from exc
+        if not raw:
+            return {}
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+
+
+class MeetingReminder:
+    """Polls Job Tracker and asks the app to pop up when a reminder is due."""
+
+    def __init__(self, settings, on_due, on_status) -> None:
+        self._settings = settings
+        self._on_due = on_due
+        self._on_status = on_status
+        self._last: dict[str, datetime] = {}
+        self._token = ""
+        self._stop = threading.Event()
+        self._check_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, name="autokey-meetings", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def forget(self) -> None:
+        self._token = ""
+
+    def check_soon(self) -> None:
+        threading.Thread(target=self._check, name="autokey-meetings-now", daemon=True).start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._check()
+            self._stop.wait(REMIND_POLL_SECONDS)
+
+    def _check(self) -> None:
+        if not self._check_lock.acquire(blocking=False):
+            return
+        try:
+            settings = self._settings()
+            server = settings.get("server") or ""
+            email = settings.get("email") or ""
+            password = settings.get("password") or ""
+            if not api_root(server) or not email or not password:
+                return
+            client = JobTrackerClient(server, email, password, self._token)
+            try:
+                meetings = client.meetings()
+            except TrackerError as exc:
+                logging.warning("Meeting check failed: %s", exc)
+                self._on_status(str(exc))
+                return
+            except Exception:
+                logging.exception("Meeting check failed")
+                self._on_status("Could not check meetings.")
+                return
+            self._token = client.token
+            now = datetime.now(timezone.utc)
+            due = due_reminders(meetings, self._last, now)
+            upcoming = 0
+            for meeting in meetings:
+                start = meeting_start(meeting)
+                if start is not None and timedelta(0) < (start - now) <= REMIND_HORIZON:
+                    upcoming += 1
+            if due:
+                self._on_due(due, now)
+                for meeting in due:
+                    self._last[meeting_key(meeting)] = now
+            if upcoming == 1:
+                self._on_status("Watching 1 interview in the next hour.")
+            elif upcoming:
+                self._on_status(f"Watching {upcoming} interviews in the next hour.")
+            else:
+                self._on_status("No interviews in the next hour.")
+        finally:
+            self._check_lock.release()
+
+
+class MeetingAlert(tk.Toplevel):
+    def __init__(self, master: tk.Misc, text: str) -> None:
+        super().__init__(master)
+        self.title("Upcoming interview")
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.configure(padx=16, pady=14)
+        self.body = tk.Label(
+            self,
+            text=text,
+            justify="left",
+            anchor="nw",
+            font=("Segoe UI", 11),
+            wraplength=420,
+        )
+        self.body.pack(anchor="w")
+        ttk.Button(self, text="Dismiss", command=self.destroy, width=12).pack(anchor="e", pady=(12, 0))
+        self._place()
+        self._beep()
+
+    def refresh(self, text: str) -> None:
+        self.body.configure(text=text)
+        self.attributes("-topmost", True)
+        self.deiconify()
+        self._place()
+        self.lift()
+        self._beep()
+
+    def _place(self) -> None:
+        self.update_idletasks()
+        width = max(self.winfo_reqwidth(), 360)
+        height = self.winfo_reqheight()
+        x = max(0, self.winfo_screenwidth() - width - 24)
+        y = max(0, self.winfo_screenheight() - height - 80)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _beep(self) -> None:
+        try:
+            user32.MessageBeep(MB_ICONINFORMATION)
+        except Exception:
+            logging.exception("Could not play the reminder sound")
+
+
 class App:
     def __init__(self) -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoKey.TextHotkeys")
@@ -981,6 +1328,13 @@ class App:
         self.status = tk.StringVar(value="No hotkeys yet.")
         self.start_with_windows = tk.BooleanVar(value=False)
         self.transform_enabled = tk.BooleanVar(value=False)
+        self.server_var = tk.StringVar(value=DEFAULT_SERVER)
+        self.email_var = tk.StringVar(value="")
+        self.password_var = tk.StringVar(value="")
+        self.meeting_status = tk.StringVar(value="Sign in to Job Tracker to get interview reminders.")
+        self._tracker_lock = threading.Lock()
+        self._tracker = {"server": DEFAULT_SERVER, "email": "", "password": ""}
+        self._alert: MeetingAlert | None = None
         self._apply_style()
         self._build()
         self._load()
@@ -990,6 +1344,8 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._worker.start()
         self._watcher.start()
+        self._reminders = MeetingReminder(self._tracker_settings, self._on_meetings_due, self._on_meeting_status)
+        self._reminders.start()
 
     def _center(self, window: tk.Misc, width: int, height: int) -> None:
         window.update_idletasks()
@@ -1106,6 +1462,32 @@ class App:
         ttk.Button(pair_buttons, text="Edit", command=self.edit_pair, width=10).pack(side="left", padx=(8, 0))
         ttk.Button(pair_buttons, text="Remove", command=self.remove_pair, width=10).pack(side="left", padx=(8, 0))
 
+        meetings = ttk.Frame(notebook, padding=8)
+        notebook.add(meetings, text="Meetings")
+        ttk.Label(
+            meetings,
+            text="Signs in to Job Tracker and watches interviews that start within the next hour. A reminder pops up every 15 minutes, and every 10 minutes once the interview is within 30 minutes.",
+            style="Hint.TLabel",
+            wraplength=760,
+        ).pack(anchor="w", pady=(0, 12))
+        form = ttk.Frame(meetings)
+        form.pack(anchor="w", fill="x")
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="Server").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=self.server_var, width=48).grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=4)
+        ttk.Label(form, text="Email").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=self.email_var, width=48).grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=4)
+        ttk.Label(form, text="Password").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=self.password_var, show="*", width=48).grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=4)
+        ttk.Label(
+            form,
+            text="Address through the port, for example http://213.59.112.27:5000. Saved on this PC only.",
+            style="Hint.TLabel",
+            wraplength=560,
+        ).grid(row=3, column=1, sticky="w", padx=(12, 0), pady=(2, 8))
+        ttk.Button(meetings, text="Save and check", command=self.save_tracker, width=18).pack(anchor="w")
+        ttk.Label(meetings, textvariable=self.meeting_status, style="Status.TLabel").pack(anchor="w", pady=(8, 0))
+
     def run(self) -> None:
         import pystray
 
@@ -1181,6 +1563,71 @@ class App:
     def _on_clipboard_transformed(self) -> None:
         self._set_status("Updated the clipboard using your spell pairs.")
 
+    def _tracker_settings(self) -> dict:
+        with self._tracker_lock:
+            return dict(self._tracker)
+
+    def save_tracker(self) -> None:
+        server = server_origin(self.server_var.get())
+        email = self.email_var.get().strip()
+        password = self.password_var.get()
+        if not server:
+            messagebox.showerror(
+                "AutoKey",
+                "Enter the Job Tracker server address, including the port.",
+                parent=self.root,
+            )
+            return
+        if bool(email) != bool(password):
+            messagebox.showerror("AutoKey", "Enter both the email and the password.", parent=self.root)
+            return
+        self.server_var.set(server)
+        with self._tracker_lock:
+            self._tracker = {"server": server, "email": email, "password": password}
+        self._save()
+        self._reminders.forget()
+        if email:
+            self.meeting_status.set("Saved. Checking interviews...")
+            self._reminders.check_soon()
+        else:
+            self.meeting_status.set("Interview reminders are off until you sign in.")
+
+    def _on_meeting_status(self, text: str) -> None:
+        def apply() -> None:
+            try:
+                self.meeting_status.set(text)
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after(0, apply)
+        except tk.TclError:
+            logging.exception("Could not update the meeting status")
+
+    def _on_meetings_due(self, meetings: list[dict], now: datetime) -> None:
+        text = "\n\n".join(meeting_alert_text(meeting, now) for meeting in meetings)
+
+        def show() -> None:
+            try:
+                self._show_alert(text)
+            except tk.TclError:
+                logging.exception("Could not show the meeting reminder")
+
+        try:
+            self.root.after(0, show)
+        except tk.TclError:
+            logging.exception("Could not schedule the meeting reminder")
+
+    def _show_alert(self, text: str) -> None:
+        if self._alert is not None:
+            try:
+                if self._alert.winfo_exists():
+                    self._alert.refresh(text)
+                    return
+            except tk.TclError:
+                pass
+        self._alert = MeetingAlert(self.root, text)
+
     def add_pair(self) -> None:
         self._edit_pair(None)
 
@@ -1247,6 +1694,7 @@ class App:
             logging.exception("Could not schedule shutdown")
 
     def _shutdown(self) -> None:
+        self._reminders.stop()
         self._watcher.stop()
         self._worker.join(timeout=5)
         self._suspend_hotkeys()
@@ -1343,6 +1791,15 @@ class App:
                 self._pairs = pairs
                 self._transform_on = enabled
             self.transform_enabled.set(enabled)
+            tracker = data.get("job_tracker") or {}
+            server = server_origin(str(tracker.get("server") or "")) or DEFAULT_SERVER
+            email = str(tracker.get("email") or "")
+            password = str(tracker.get("password") or "")
+            with self._tracker_lock:
+                self._tracker = {"server": server, "email": email, "password": password}
+            self.server_var.set(server)
+            self.email_var.set(email)
+            self.password_var.set(password)
         except Exception:
             logging.exception("Could not read %s", CONFIG_PATH)
             backup = CONFIG_PATH.with_suffix(".json.bak")
@@ -1356,11 +1813,18 @@ class App:
         with self._pair_lock:
             pairs = list(self._pairs)
             enabled = self._transform_on
+        with self._tracker_lock:
+            tracker = dict(self._tracker)
         payload = {
             "bindings": [{"hotkey": hotkey, "file": path} for hotkey, path in self._bindings],
             "clipboard_transform": {
                 "enabled": enabled,
                 "pairs": [{"from": source, "to": dest} for source, dest in pairs],
+            },
+            "job_tracker": {
+                "server": tracker.get("server") or DEFAULT_SERVER,
+                "email": tracker.get("email") or "",
+                "password": tracker.get("password") or "",
             },
         }
         temporary = CONFIG_PATH.with_suffix(".json.tmp")
@@ -1523,6 +1987,61 @@ def self_test() -> None:
         if transform_text("hello", [("A", "B")]) != "hello":
             raise SystemExit("unrelated text should stay")
         make_icon()
+        if interview_step_label(1) != "1st interview" or interview_step_label(2) != "2nd interview":
+            raise SystemExit("step label failed")
+        if interview_step_label(3) != "3rd interview" or interview_step_label(11) != "11th interview":
+            raise SystemExit("step label failed")
+        if interview_step_label(21) != "21st interview":
+            raise SystemExit("step label failed")
+        if api_root("http://213.59.112.27:5000/api/jobs") != "http://213.59.112.27:5000/api":
+            raise SystemExit("api root failed")
+        if server_origin("213.59.112.27:5000") != "http://213.59.112.27:5000":
+            raise SystemExit("server origin failed")
+        now = datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)
+
+        def sample(minutes: int, ident: str, step: int = 2) -> dict:
+            start = (now + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+            return {
+                "jobId": "j1",
+                "jobTitle": "AI Engineer",
+                "companyName": "Stride",
+                "step": step,
+                "interview": {
+                    "_id": ident,
+                    "startsAt": start,
+                    "interviewers": [{"name": "Avery Chen"}],
+                },
+            }
+
+        remembered: dict[str, datetime] = {}
+        if len(due_reminders([sample(50, "hour")], remembered, now)) != 1:
+            raise SystemExit("a meeting inside the hour should remind")
+        remembered["hour"] = now
+        if due_reminders([sample(50, "hour")], remembered, now + timedelta(minutes=10)):
+            raise SystemExit("the 15 minute reminder came early")
+        if len(due_reminders([sample(50, "hour")], remembered, now + timedelta(minutes=15))) != 1:
+            raise SystemExit("the 15 minute reminder was missed")
+        soon_seen = {"soon": now}
+        if due_reminders([sample(25, "soon")], soon_seen, now + timedelta(minutes=9)):
+            raise SystemExit("the 10 minute reminder came early")
+        if len(due_reminders([sample(25, "soon")], soon_seen, now + timedelta(minutes=10))) != 1:
+            raise SystemExit("the 10 minute reminder was missed")
+        if due_reminders([sample(90, "later")], {}, now):
+            raise SystemExit("a meeting beyond an hour should stay quiet")
+        if due_reminders([sample(-5, "past")], {}, now):
+            raise SystemExit("a past meeting should stay quiet")
+        date_only = {
+            "companyName": "Stride",
+            "step": 1,
+            "interview": {"_id": "day", "date": now.isoformat(), "interviewers": [{"name": "Avery Chen"}]},
+        }
+        if due_reminders([date_only], {}, now):
+            raise SystemExit("a date-only interview should stay quiet")
+        alert = meeting_alert_text(sample(40, "text"), now)
+        if "Stride" not in alert or "2nd interview" not in alert or "Avery Chen" not in alert:
+            raise SystemExit("alert text is missing the meeting details")
+        if "Remaining: 40 minutes" not in alert:
+            raise SystemExit("alert text is missing the remaining time")
         command = startup_command()
         if str(APP_DIR) not in command or "autokey" not in command.casefold():
             raise SystemExit("startup command is wrong")
