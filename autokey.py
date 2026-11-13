@@ -7,9 +7,8 @@ Exit is only on the tray menu.
 A hotkey copies that file's text into the focused box, then puts back whatever
 was on the clipboard before the paste.
 
-The Meetings tab signs in to Job Tracker. Interviews that start within the
-next hour raise a popup every 15 minutes, and every 10 minutes once they
-are within 30 minutes.
+The Meetings tab signs in to Job Tracker. The server decides which interviews
+in the next hour are due, and AutoKey shows those reminders.
 
 Start it with run.bat. On a new computer, run.bat builds a local .venv
 from whatever Python 3 is installed; do not copy .venv between machines.
@@ -45,6 +44,7 @@ except ImportError:
     )
     raise SystemExit(1)
 
+APP_VERSION = "1.1.0"
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "bindings.json"
 LOG_PATH = APP_DIR / "autokey.log"
@@ -58,8 +58,10 @@ MAX_FORMAT_BYTES = 64 * 1024 * 1024
 DEFAULT_SERVER = "http://213.59.112.27:5000"
 REMIND_HORIZON = timedelta(hours=1)
 REMIND_SOON = timedelta(minutes=30)
+REMIND_CLOSE = timedelta(minutes=15)
 REMIND_EVERY = timedelta(minutes=15)
 REMIND_SOON_EVERY = timedelta(minutes=10)
+REMIND_CLOSE_EVERY = timedelta(minutes=5)
 REMIND_POLL_SECONDS = 30
 
 CF_UNICODETEXT = 13
@@ -1028,7 +1030,7 @@ def parse_server_time(value) -> datetime | None:
 
 def meeting_start(meeting: dict) -> datetime | None:
     interview = meeting.get("interview") or {}
-    return parse_server_time(interview.get("startsAt"))
+    return parse_server_time(interview.get("startsAt") or meeting.get("startsAt"))
 
 
 def meeting_key(meeting: dict) -> str:
@@ -1040,6 +1042,9 @@ def meeting_key(meeting: dict) -> str:
 
 
 def interviewer_label(meeting: dict) -> str:
+    direct = str(meeting.get("interviewer") or "").strip()
+    if direct:
+        return direct
     interview = meeting.get("interview") or {}
     names = []
     for person in interview.get("interviewers") or []:
@@ -1053,6 +1058,8 @@ def reminder_gap(until_start: timedelta) -> timedelta | None:
     """How long to wait before reminding again. None means this meeting is outside the window."""
     if until_start <= timedelta(0) or until_start > REMIND_HORIZON:
         return None
+    if until_start <= REMIND_CLOSE:
+        return REMIND_CLOSE_EVERY
     if until_start <= REMIND_SOON:
         return REMIND_SOON_EVERY
     return REMIND_EVERY
@@ -1103,14 +1110,15 @@ def meeting_alert_text(meeting: dict, now: datetime) -> str:
     title = str(meeting.get("jobTitle") or "").strip()
     lines = [
         company,
-        interview_step_label(meeting.get("step") or 1),
+        str(meeting.get("stepLabel") or "").strip() or interview_step_label(meeting.get("step") or 1),
         f"Interviewer: {interviewer_label(meeting)}",
     ]
     if title:
         lines.append(title)
     if start is not None:
         lines.append(format_local_time(start))
-        lines.append(f"Remaining: {remaining_label(start, now)}")
+        remaining = str(meeting.get("remainingLabel") or "").strip() or remaining_label(start, now)
+        lines.append(f"Remaining: {remaining}")
     return "\n".join(lines)
 
 
@@ -1129,20 +1137,44 @@ class JobTrackerClient:
         self.password = password or ""
         self.token = token or ""
 
-    def meetings(self) -> list[dict]:
+    def reminders(self) -> dict:
+        payload = self._authorized("GET", "/autokey/reminders")
+        due = payload.get("due") if isinstance(payload, dict) else None
+        upcoming = payload.get("upcoming") if isinstance(payload, dict) else None
+        return {
+            "due": list(due) if isinstance(due, list) else [],
+            "upcoming": list(upcoming) if isinstance(upcoming, list) else [],
+        }
+
+    def acknowledge(self, interview_ids: list[str]) -> None:
+        ids = [str(item) for item in interview_ids if item]
+        if ids:
+            self._authorized("POST", "/autokey/reminders/ack", {"interviewIds": ids})
+
+    def fetch_config(self) -> dict:
+        payload = self._authorized("GET", "/autokey/config")
+        return payload if isinstance(payload, dict) else {}
+
+    def save_config(self, config: dict) -> dict:
+        payload = self._authorized("PUT", "/autokey/config", config)
+        return payload if isinstance(payload, dict) else {}
+
+    def import_config(self, config: dict) -> dict:
+        payload = self._authorized("POST", "/autokey/config/import", config)
+        return payload if isinstance(payload, dict) else {}
+
+    def _authorized(self, method: str, path: str, body: dict | None = None) -> dict:
         if not self.root:
             raise TrackerError("Enter the Job Tracker server address.")
         if not self.token:
             self.login()
         try:
-            payload = self._request("GET", "/calendar")
+            return self._request(method, path, body)
         except TrackerError as exc:
             if exc.status != 401:
                 raise
             self.login()
-            payload = self._request("GET", "/calendar")
-        meetings = payload.get("meetings") if isinstance(payload, dict) else None
-        return list(meetings) if isinstance(meetings, list) else []
+            return self._request(method, path, body)
 
     def login(self) -> str:
         if not self.email or not self.password:
@@ -1191,11 +1223,11 @@ class JobTrackerClient:
 class MeetingReminder:
     """Polls Job Tracker and asks the app to pop up when a reminder is due."""
 
-    def __init__(self, settings, on_due, on_status) -> None:
+    def __init__(self, settings, on_due, on_status, on_token=None) -> None:
         self._settings = settings
         self._on_due = on_due
         self._on_status = on_status
-        self._last: dict[str, datetime] = {}
+        self._on_token = on_token
         self._token = ""
         self._stop = threading.Event()
         self._check_lock = threading.Lock()
@@ -1209,6 +1241,9 @@ class MeetingReminder:
 
     def forget(self) -> None:
         self._token = ""
+
+    def use_token(self, token: str) -> None:
+        self._token = token or ""
 
     def check_soon(self) -> None:
         threading.Thread(target=self._check, name="autokey-meetings-now", daemon=True).start()
@@ -1228,9 +1263,10 @@ class MeetingReminder:
             password = settings.get("password") or ""
             if not api_root(server) or not email or not password:
                 return
-            client = JobTrackerClient(server, email, password, self._token)
+            saved_token = settings.get("token") or ""
+            client = JobTrackerClient(server, email, password, self._token or saved_token)
             try:
-                meetings = client.meetings()
+                report = client.reminders()
             except TrackerError as exc:
                 logging.warning("Meeting check failed: %s", exc)
                 self._on_status(str(exc))
@@ -1239,18 +1275,14 @@ class MeetingReminder:
                 logging.exception("Meeting check failed")
                 self._on_status("Could not check meetings.")
                 return
+            previous = self._token or saved_token
             self._token = client.token
-            now = datetime.now(timezone.utc)
-            due = due_reminders(meetings, self._last, now)
-            upcoming = 0
-            for meeting in meetings:
-                start = meeting_start(meeting)
-                if start is not None and timedelta(0) < (start - now) <= REMIND_HORIZON:
-                    upcoming += 1
+            if self._on_token and client.token and client.token != previous:
+                self._on_token(client.token)
+            due = report["due"]
+            upcoming = len(report["upcoming"])
             if due:
-                self._on_due(due, now)
-                for meeting in due:
-                    self._last[meeting_key(meeting)] = now
+                self._on_due(due, datetime.now(timezone.utc), lambda ids: self._acknowledge(client, ids))
             if upcoming == 1:
                 self._on_status("Watching 1 interview in the next hour.")
             elif upcoming:
@@ -1259,6 +1291,15 @@ class MeetingReminder:
                 self._on_status("No interviews in the next hour.")
         finally:
             self._check_lock.release()
+
+    def _acknowledge(self, client: JobTrackerClient, interview_ids: list[str]) -> None:
+        def work() -> None:
+            try:
+                client.acknowledge(interview_ids)
+            except Exception:
+                logging.exception("Could not tell Job Tracker the reminder was shown")
+
+        threading.Thread(target=work, name="autokey-ack", daemon=True).start()
 
 
 class MeetingAlert(tk.Toplevel):
@@ -1331,9 +1372,10 @@ class App:
         self.server_var = tk.StringVar(value=DEFAULT_SERVER)
         self.email_var = tk.StringVar(value="")
         self.password_var = tk.StringVar(value="")
-        self.meeting_status = tk.StringVar(value="Sign in to Job Tracker to get interview reminders.")
+        self.meeting_status = tk.StringVar(value="Sign in to watch interviews.")
+        self.account_status = tk.StringVar(value="Not signed in.")
         self._tracker_lock = threading.Lock()
-        self._tracker = {"server": DEFAULT_SERVER, "email": "", "password": ""}
+        self._tracker = {"server": DEFAULT_SERVER, "email": "", "password": "", "token": "", "name": ""}
         self._alert: MeetingAlert | None = None
         self._apply_style()
         self._build()
@@ -1344,7 +1386,13 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self._worker.start()
         self._watcher.start()
-        self._reminders = MeetingReminder(self._tracker_settings, self._on_meetings_due, self._on_meeting_status)
+        self._reminders = MeetingReminder(
+            self._tracker_settings,
+            self._on_meetings_due,
+            self._on_meeting_status,
+            self._on_tracker_token,
+        )
+        self._reminders.use_token(self._tracker_settings().get("token") or "")
         self._reminders.start()
 
     def _center(self, window: tk.Misc, width: int, height: int) -> None:
@@ -1388,11 +1436,23 @@ class App:
             text="Closing this window hides it and leaves the hotkeys running. Choose Exit on the tray icon to quit.",
             style="Hint.TLabel",
             wraplength=800,
+        ).pack(anchor="w", pady=(0, 2))
+        ttk.Label(
+            outer,
+            text="Hotkeys and clipboard pairs are stored on your Job Tracker account. Export and import move that configuration as a file.",
+            style="Hint.TLabel",
+            wraplength=800,
         ).pack(anchor="w", pady=(0, 12))
 
         footer = ttk.Frame(outer)
         footer.pack(side="bottom", fill="x", pady=(12, 0))
         ttk.Button(footer, text="Hide Window", command=self.hide_window, width=16).pack(side="right")
+        config_buttons = ttk.Frame(footer)
+        config_buttons.pack(anchor="w")
+        ttk.Button(config_buttons, text="Export configuration", command=self.export_configuration, width=22).pack(side="left")
+        ttk.Button(config_buttons, text="Import configuration", command=self.import_configuration, width=22).pack(
+            side="left", padx=(8, 0)
+        )
         tk.Checkbutton(
             footer,
             text="Start AutoKey when Windows starts",
@@ -1403,11 +1463,11 @@ class App:
         ).pack(anchor="w")
         ttk.Label(footer, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(4, 0))
 
-        notebook = ttk.Notebook(outer)
-        notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.pack(fill="both", expand=True)
 
-        hotkeys = ttk.Frame(notebook, padding=8)
-        notebook.add(hotkeys, text="Hotkeys")
+        hotkeys = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(hotkeys, text="Hotkeys")
         table = ttk.Frame(hotkeys)
         table.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(table, columns=("hotkey", "file", "preview"), show="headings", selectmode="browse")
@@ -1428,8 +1488,8 @@ class App:
         ttk.Button(hotkey_buttons, text="Edit", command=self.edit_binding, width=10).pack(side="left", padx=(8, 0))
         ttk.Button(hotkey_buttons, text="Remove", command=self.remove_binding, width=10).pack(side="left", padx=(8, 0))
 
-        transform = ttk.Frame(notebook, padding=8)
-        notebook.add(transform, text="Clipboard transform")
+        transform = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(transform, text="Clipboard transform")
         tk.Checkbutton(
             transform,
             text="Enable clipboard transformation",
@@ -1462,11 +1522,12 @@ class App:
         ttk.Button(pair_buttons, text="Edit", command=self.edit_pair, width=10).pack(side="left", padx=(8, 0))
         ttk.Button(pair_buttons, text="Remove", command=self.remove_pair, width=10).pack(side="left", padx=(8, 0))
 
-        meetings = ttk.Frame(notebook, padding=8)
-        notebook.add(meetings, text="Meetings")
+        meetings = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(meetings, text="Meetings")
+        self._meetings_tab = meetings
         ttk.Label(
             meetings,
-            text="Signs in to Job Tracker and watches interviews that start within the next hour. A reminder pops up every 15 minutes, and every 10 minutes once the interview is within 30 minutes.",
+            text="Sign in with the Job Tracker account. AutoKey then watches interviews that start within the next hour.",
             style="Hint.TLabel",
             wraplength=760,
         ).pack(anchor="w", pady=(0, 12))
@@ -1481,24 +1542,38 @@ class App:
         ttk.Entry(form, textvariable=self.password_var, show="*", width=48).grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=4)
         ttk.Label(
             form,
-            text="Address through the port, for example http://213.59.112.27:5000. Saved on this PC only.",
+            text="Address through the port, for example http://213.59.112.27:5000. The sign-in stays on this PC.",
             style="Hint.TLabel",
             wraplength=560,
         ).grid(row=3, column=1, sticky="w", padx=(12, 0), pady=(2, 8))
-        ttk.Button(meetings, text="Save and check", command=self.save_tracker, width=18).pack(anchor="w")
-        ttk.Label(meetings, textvariable=self.meeting_status, style="Status.TLabel").pack(anchor="w", pady=(8, 0))
+        actions = ttk.Frame(meetings)
+        actions.pack(anchor="w")
+        self._signin_button = ttk.Button(actions, text="Sign in", command=self.sign_in, width=14)
+        self._signin_button.pack(side="left")
+        self._signout_button = ttk.Button(actions, text="Sign out", command=self.sign_out, width=14)
+        self._signout_button.pack(side="left", padx=(8, 0))
+        ttk.Label(meetings, textvariable=self.account_status, style="Status.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(meetings, textvariable=self.meeting_status, style="Status.TLabel").pack(anchor="w", pady=(2, 0))
 
     def run(self) -> None:
         import pystray
 
         menu = pystray.Menu(
             pystray.MenuItem("Show App", self.show_window, default=True),
+            pystray.MenuItem("Sign in", self.show_sign_in),
+            pystray.MenuItem("Help", self.show_help),
             pystray.MenuItem("Exit", self.exit_app),
         )
         self.icon = pystray.Icon("AutoKey", self._icon_image, "AutoKey", menu)
         self._register_hotkeys()
+        self._sync_config_from_server()
         self.icon.run_detached(self._on_icon_ready)
-        logging.info("AutoKey ready with %s hotkey(s)", len(self._bindings))
+        logging.info("AutoKey %s ready with %s hotkey(s)", APP_VERSION, len(self._bindings))
+        tracker = self._tracker_settings()
+        if tracker.get("email") and tracker.get("password"):
+            logging.info("Checking Job Tracker for interviews in the next hour")
+        else:
+            logging.info("Interview reminders are off until you sign in")
         self.root.mainloop()
 
     def _on_icon_ready(self, icon) -> None:
@@ -1507,6 +1582,16 @@ class App:
             icon.notify("Right-click the tray icon and choose Show App.", "AutoKey is running")
         except Exception:
             logging.exception("Could not show the startup notification")
+
+    def show_sign_in(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._show_sign_in)
+
+    def _show_sign_in(self) -> None:
+        self._show_window()
+        self.notebook.select(self._meetings_tab)
+
+    def show_help(self, _icon=None, _item=None) -> None:
+        message_box(f"Version {APP_VERSION}", "AutoKey")
 
     def show_window(self, _icon=None, _item=None) -> None:
         self.root.after(0, self._show_window)
@@ -1567,7 +1652,7 @@ class App:
         with self._tracker_lock:
             return dict(self._tracker)
 
-    def save_tracker(self) -> None:
+    def sign_in(self) -> None:
         server = server_origin(self.server_var.get())
         email = self.email_var.get().strip()
         password = self.password_var.get()
@@ -1578,19 +1663,90 @@ class App:
                 parent=self.root,
             )
             return
-        if bool(email) != bool(password):
-            messagebox.showerror("AutoKey", "Enter both the email and the password.", parent=self.root)
+        if not email or not password:
+            messagebox.showerror("AutoKey", "Enter the email and the password.", parent=self.root)
             return
         self.server_var.set(server)
+        self.account_status.set("Signing in...")
+        self._signin_button.state(["disabled"])
+
+        def work() -> None:
+            client = JobTrackerClient(server, email, password)
+            try:
+                client.login()
+                payload = client._request("GET", "/auth/me")
+                user = payload.get("user") if isinstance(payload, dict) else {}
+                name = str((user or {}).get("name") or email).strip() or email
+            except TrackerError as exc:
+                message = str(exc)
+                self.root.after(0, lambda: self._sign_in_failed(message))
+                return
+            except Exception:
+                logging.exception("Sign-in failed")
+                self.root.after(0, lambda: self._sign_in_failed("Could not reach Job Tracker."))
+                return
+            token = client.token
+            self.root.after(0, lambda: self._sign_in_ok(server, email, password, token, name))
+
+        threading.Thread(target=work, name="autokey-signin", daemon=True).start()
+
+    def _sign_in_failed(self, message: str) -> None:
+        try:
+            self._signin_button.state(["!disabled"])
+        except tk.TclError:
+            return
+        self._refresh_account_status()
+        self.meeting_status.set(message)
+        messagebox.showerror("AutoKey", message, parent=self.root)
+
+    def _sign_in_ok(self, server: str, email: str, password: str, token: str, name: str) -> None:
+        try:
+            self._signin_button.state(["!disabled"])
+        except tk.TclError:
+            return
         with self._tracker_lock:
-            self._tracker = {"server": server, "email": email, "password": password}
+            self._tracker = {
+                "server": server,
+                "email": email,
+                "password": password,
+                "token": token,
+                "name": name,
+            }
+        self._write_local()
+        self._reminders.use_token(token)
+        self._refresh_account_status()
+        self.meeting_status.set("Checking interviews...")
+        logging.info("Signed in to Job Tracker as %s", email)
+        self._reminders.check_soon()
+        self._sync_config_from_server()
+
+    def sign_out(self) -> None:
+        with self._tracker_lock:
+            server = self._tracker.get("server") or server_origin(self.server_var.get()) or DEFAULT_SERVER
+            self._tracker = {"server": server, "email": "", "password": "", "token": "", "name": ""}
+        self.email_var.set("")
+        self.password_var.set("")
         self._save()
         self._reminders.forget()
-        if email:
-            self.meeting_status.set("Saved. Checking interviews...")
-            self._reminders.check_soon()
+        self._refresh_account_status()
+        self.meeting_status.set("Signed out. Interview reminders are off.")
+
+    def _refresh_account_status(self) -> None:
+        with self._tracker_lock:
+            name = str(self._tracker.get("name") or "")
+            email = str(self._tracker.get("email") or "")
+            token = str(self._tracker.get("token") or "")
+        if token or email:
+            self.account_status.set(f"Signed in as {name or email}.")
         else:
-            self.meeting_status.set("Interview reminders are off until you sign in.")
+            self.account_status.set("Not signed in.")
+
+    def _on_tracker_token(self, token: str) -> None:
+        with self._tracker_lock:
+            if self._tracker.get("token") == token:
+                return
+            self._tracker = {**self._tracker, "token": token}
+        self._save()
 
     def _on_meeting_status(self, text: str) -> None:
         def apply() -> None:
@@ -1604,14 +1760,19 @@ class App:
         except tk.TclError:
             logging.exception("Could not update the meeting status")
 
-    def _on_meetings_due(self, meetings: list[dict], now: datetime) -> None:
+    def _on_meetings_due(self, meetings: list[dict], now: datetime, acknowledge=None) -> None:
+        logging.info("Showing a reminder for %s interview(s)", len(meetings))
         text = "\n\n".join(meeting_alert_text(meeting, now) for meeting in meetings)
+        ids = [str(meeting.get("interviewId")) for meeting in meetings if meeting.get("interviewId")]
 
         def show() -> None:
             try:
                 self._show_alert(text)
             except tk.TclError:
                 logging.exception("Could not show the meeting reminder")
+                return
+            if acknowledge and ids:
+                acknowledge(ids)
 
         try:
             self.root.after(0, show)
@@ -1760,46 +1921,88 @@ class App:
     def _hotkey_from_row(self, row_id: str) -> str:
         return row_id[3:]
 
+    def _read_config_lists(self, data: dict) -> tuple[list[tuple[str, str]], bool, list[tuple[str, str]]]:
+        bindings = []
+        seen: set[str] = set()
+        for item in data.get("bindings") or []:
+            if not isinstance(item, dict):
+                continue
+            hotkey = str(item.get("hotkey") or "").strip()
+            path = str(item.get("file") or "").strip()
+            if not hotkey or not path or hotkey in seen:
+                continue
+            seen.add(hotkey)
+            bindings.append((hotkey, path))
+        transform = data.get("clipboard_transform") or data.get("clipboardTransform") or {}
+        enabled = bool(transform.get("enabled", False))
+        pairs: list[tuple[str, str]] = []
+        seen_spells: set[str] = set()
+        for item in transform.get("pairs") or []:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("from", ""))
+            dest = str(item.get("to", ""))
+            if not source or source in seen_spells:
+                continue
+            seen_spells.add(source)
+            pairs.append((source, dest))
+        return bindings, enabled, pairs
+
+    def _apply_config(self, data: dict) -> None:
+        bindings, enabled, pairs = self._read_config_lists(data)
+        self._bindings = bindings
+        with self._pair_lock:
+            self._pairs = pairs
+            self._transform_on = enabled
+        self.transform_enabled.set(enabled)
+
+    def _config_payload(self) -> dict:
+        with self._pair_lock:
+            pairs = list(self._pairs)
+            enabled = self._transform_on
+        return {
+            "bindings": [{"hotkey": hotkey, "file": path} for hotkey, path in self._bindings],
+            "clipboard_transform": {
+                "enabled": enabled,
+                "pairs": [{"from": source, "to": dest} for source, dest in pairs],
+            },
+        }
+
+    def _tracker_client(self) -> JobTrackerClient | None:
+        settings = self._tracker_settings()
+        if not settings.get("email") or not settings.get("password"):
+            return None
+        return JobTrackerClient(
+            settings.get("server") or "",
+            settings.get("email") or "",
+            settings.get("password") or "",
+            settings.get("token") or "",
+        )
+
     def _load(self) -> None:
         if not CONFIG_PATH.exists():
             return
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            raw = data.get("bindings", [])
-            bindings = []
-            seen: set[str] = set()
-            for item in raw:
-                hotkey = str(item["hotkey"])
-                path = str(item["file"])
-                if hotkey in seen:
-                    continue
-                seen.add(hotkey)
-                bindings.append((hotkey, path))
-            self._bindings = bindings
-            transform = data.get("clipboard_transform") or {}
-            enabled = bool(transform.get("enabled", False))
-            pairs: list[tuple[str, str]] = []
-            seen_spells: set[str] = set()
-            for item in transform.get("pairs") or []:
-                source = str(item.get("from", ""))
-                dest = str(item.get("to", ""))
-                if not source or source in seen_spells:
-                    continue
-                seen_spells.add(source)
-                pairs.append((source, dest))
-            with self._pair_lock:
-                self._pairs = pairs
-                self._transform_on = enabled
-            self.transform_enabled.set(enabled)
+            self._apply_config(data)
             tracker = data.get("job_tracker") or {}
             server = server_origin(str(tracker.get("server") or "")) or DEFAULT_SERVER
             email = str(tracker.get("email") or "")
             password = str(tracker.get("password") or "")
+            token = str(tracker.get("token") or "")
+            name = str(tracker.get("name") or "")
             with self._tracker_lock:
-                self._tracker = {"server": server, "email": email, "password": password}
+                self._tracker = {
+                    "server": server,
+                    "email": email,
+                    "password": password,
+                    "token": token,
+                    "name": name,
+                }
             self.server_var.set(server)
             self.email_var.set(email)
             self.password_var.set(password)
+            self._refresh_account_status()
         except Exception:
             logging.exception("Could not read %s", CONFIG_PATH)
             backup = CONFIG_PATH.with_suffix(".json.bak")
@@ -1809,27 +2012,183 @@ class App:
                 pass
             messagebox.showwarning("AutoKey", "The saved hotkey list could not be read. Starting with an empty list.")
 
-    def _save(self) -> None:
-        with self._pair_lock:
-            pairs = list(self._pairs)
-            enabled = self._transform_on
+    def _write_local(self) -> None:
         with self._tracker_lock:
             tracker = dict(self._tracker)
-        payload = {
-            "bindings": [{"hotkey": hotkey, "file": path} for hotkey, path in self._bindings],
-            "clipboard_transform": {
-                "enabled": enabled,
-                "pairs": [{"from": source, "to": dest} for source, dest in pairs],
-            },
-            "job_tracker": {
-                "server": tracker.get("server") or DEFAULT_SERVER,
-                "email": tracker.get("email") or "",
-                "password": tracker.get("password") or "",
-            },
+        payload = self._config_payload()
+        payload["job_tracker"] = {
+            "server": tracker.get("server") or DEFAULT_SERVER,
+            "email": tracker.get("email") or "",
+            "password": tracker.get("password") or "",
+            "token": tracker.get("token") or "",
+            "name": tracker.get("name") or "",
         }
         temporary = CONFIG_PATH.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temporary.replace(CONFIG_PATH)
+
+    def _save(self) -> None:
+        self._write_local()
+        payload = self._config_payload()
+        settings = self._tracker_settings()
+        self._push_config(settings, payload)
+
+    def _push_config(self, settings: dict, payload: dict) -> None:
+        if not settings.get("email") or not settings.get("password"):
+            return
+
+        def work() -> None:
+            client = JobTrackerClient(
+                settings.get("server") or "",
+                settings.get("email") or "",
+                settings.get("password") or "",
+                settings.get("token") or "",
+            )
+            try:
+                client.save_config(payload)
+            except Exception:
+                logging.exception("Could not store AutoKey configuration")
+                try:
+                    self.root.after(0, lambda: self.status.set("Could not store the configuration on the server."))
+                except tk.TclError:
+                    pass
+                return
+            if client.token and client.token != (settings.get("token") or ""):
+                self._on_tracker_token(client.token)
+
+        threading.Thread(target=work, name="autokey-config", daemon=True).start()
+
+    def _sync_config_from_server(self) -> None:
+        client = self._tracker_client()
+        if client is None:
+            return
+        local_payload = self._config_payload()
+
+        def work() -> None:
+            try:
+                remote = client.fetch_config()
+            except Exception:
+                logging.exception("Could not load AutoKey configuration")
+                try:
+                    self.root.after(0, lambda: self.status.set("Could not load the configuration from the server."))
+                except tk.TclError:
+                    pass
+                return
+            if client.token:
+                self._reminders.use_token(client.token)
+
+            def apply() -> None:
+                if not remote.get("configured"):
+                    has_local = bool(local_payload["bindings"] or local_payload["clipboard_transform"]["pairs"] or local_payload["clipboard_transform"]["enabled"])
+                    if has_local:
+                        self._push_config(self._tracker_settings(), local_payload)
+                        self.status.set("Stored the current configuration on the server.")
+                    return
+                self._apply_config(remote)
+                self._write_local()
+                self._refresh_rows()
+                self._refresh_pairs()
+                self._register_hotkeys()
+                self.status.set("Loaded hotkeys and clipboard settings from the server.")
+
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                logging.exception("Could not apply the server configuration")
+
+        threading.Thread(target=work, name="autokey-config-sync", daemon=True).start()
+
+    def export_configuration(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export AutoKey configuration",
+            defaultextension=".json",
+            initialfile="autokey-config.json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        client = self._tracker_client()
+        fallback = self._config_payload()
+
+        def work() -> None:
+            payload = fallback
+            if client is not None:
+                try:
+                    remote = client.fetch_config()
+                    if remote.get("configured"):
+                        payload = {
+                            "bindings": remote.get("bindings") or [],
+                            "clipboard_transform": remote.get("clipboard_transform") or {"enabled": False, "pairs": []},
+                        }
+                except Exception:
+                    logging.exception("Could not export the server configuration")
+            try:
+                Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except OSError:
+                logging.exception("Could not write the export file")
+                self.root.after(0, lambda: messagebox.showerror("AutoKey", "Could not write that file.", parent=self.root))
+                return
+            self.root.after(0, lambda: self.status.set("Exported the configuration."))
+
+        threading.Thread(target=work, name="autokey-export", daemon=True).start()
+
+    def import_configuration(self) -> None:
+        if self._tracker_client() is None:
+            messagebox.showerror(
+                "AutoKey",
+                "Sign in before importing so the configuration is stored on the server.",
+                parent=self.root,
+            )
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Import AutoKey configuration",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            messagebox.showerror("AutoKey", "That file could not be read.", parent=self.root)
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("bindings"), list):
+            messagebox.showerror("AutoKey", "That file is not an AutoKey configuration.", parent=self.root)
+            return
+        client = self._tracker_client()
+
+        def work() -> None:
+            try:
+                saved = client.import_config(
+                    {
+                        "bindings": data.get("bindings") or [],
+                        "clipboard_transform": data.get("clipboard_transform") or data.get("clipboardTransform") or {},
+                    }
+                )
+            except TrackerError as exc:
+                message = str(exc)
+                self.root.after(0, lambda: messagebox.showerror("AutoKey", message, parent=self.root))
+                return
+            except Exception:
+                logging.exception("Could not import AutoKey configuration")
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror("AutoKey", "Could not store the configuration on the server.", parent=self.root),
+                )
+                return
+
+            def apply() -> None:
+                self._apply_config(saved)
+                self._write_local()
+                self._refresh_rows()
+                self._refresh_pairs()
+                self._register_hotkeys()
+                self.status.set("Imported the configuration and stored it on the server.")
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=work, name="autokey-import", daemon=True).start()
 
     def _refresh_rows(self) -> None:
         current = set(self.tree.get_children())
@@ -2026,6 +2385,11 @@ def self_test() -> None:
             raise SystemExit("the 10 minute reminder came early")
         if len(due_reminders([sample(25, "soon")], soon_seen, now + timedelta(minutes=10))) != 1:
             raise SystemExit("the 10 minute reminder was missed")
+        close_seen = {"close": now}
+        if due_reminders([sample(12, "close")], close_seen, now + timedelta(minutes=4)):
+            raise SystemExit("the 5 minute reminder came early")
+        if len(due_reminders([sample(12, "close")], close_seen, now + timedelta(minutes=5))) != 1:
+            raise SystemExit("the 5 minute reminder was missed")
         if due_reminders([sample(90, "later")], {}, now):
             raise SystemExit("a meeting beyond an hour should stay quiet")
         if due_reminders([sample(-5, "past")], {}, now):
